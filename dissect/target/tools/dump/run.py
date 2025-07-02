@@ -6,6 +6,8 @@ import itertools
 import sys
 from collections import deque
 from dataclasses import dataclass
+from multiprocessing import Pool
+from multiprocessing import Lock
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -116,7 +118,7 @@ def produce_target_func_pairs(
             state.mark_as_finished(target, func_def.name)
 
 
-def execute_functions(target_func_stream: Iterable[tuple[Target, str]]) -> Iterator[RecordStreamElement]:
+def execute_functions(target_func_stream: Iterable[tuple[Target, FunctionDescriptor]]) -> Iterator[RecordStreamElement]:
     """Execute a function on a target for target / function pairs in the stream.
 
     Returns a generator of ``RecordStreamElement`` objects.
@@ -168,6 +170,30 @@ def persist_processing_state(
             yield element
 
 
+class PipelineWorker:
+    lock = None
+
+    def __init__(self, limit, state, lock):
+        self.limit = limit
+        self.state = state
+        PipelineWorker.lock = lock
+
+    def run(self, target, function):
+        target_func_pairs_stream = produce_target_func_pairs(get_targets([target]), function, self.state)
+        record_stream = execute_functions(target_func_pairs_stream)
+
+        if self.limit:
+            record_stream = itertools.islice(record_stream, self.limit)
+
+        with self.lock:
+            record_stream = sink_records(record_stream, self.state)
+            record_stream = log_progress(record_stream)
+            record_stream = persist_processing_state(record_stream, self.state)
+
+            # exhaust the generator, executing all pipeline steps
+            deque(record_stream, maxlen=0)
+
+
 def execute_pipeline(
     targets: list[str],
     functions: str,
@@ -216,18 +242,15 @@ def execute_pipeline(
         log.info("New state created", restart=restart, state=state.path)
 
     targets_stream = get_targets(targets)
-    target_func_pairs_stream = produce_target_func_pairs(targets_stream, functions, state)
-    record_stream = execute_functions(target_func_pairs_stream)
+    target_func_pairs_stream = [
+        (target.path, function.name) for target, function in produce_target_func_pairs(targets_stream, functions, state)
+    ]
 
-    if limit:
-        record_stream = itertools.islice(record_stream, limit)
+    lock = Lock()
+    worker = PipelineWorker(limit, state, lock)
 
-    record_stream = sink_records(record_stream, state)
-    record_stream = log_progress(record_stream)
-    record_stream = persist_processing_state(record_stream, state)
-
-    # exhaust the generator, executing all pipeline steps
-    deque(record_stream, maxlen=0)
+    with Pool(processes=20, initializer=PipelineWorker, initargs=(limit, state, lock,)) as process_pool:
+        process_pool.starmap(worker.run, target_func_pairs_stream)
 
     log.info("Pipeline has finished")
 
